@@ -1,48 +1,57 @@
 import cv2
+from src.camera import Camera
 
 
-def test_camera():
+def main():
+    print("=" * 50)
+    print("HEART RATE PREDICTION - CAMERA TEST")
+    print("=" * 50)
 
-    print("Opening MacBook camera...")
-
-    cap = cv2.VideoCapture(
-        0,
-        cv2.CAP_AVFOUNDATION
+    camera = Camera(
+        camera_index=0,
+        width=640,
+        height=480
     )
 
-    if not cap.isOpened():
-        print("ERROR: Camera could not be opened.")
+    if not camera.start():
+        print("Camera test failed.")
         return
 
-    print("Camera opened successfully.")
-
-    # Give camera time to initialise
-    for _ in range(30):
-        cap.read()
+    print(f"Camera FPS: {camera.get_fps():.2f}")
+    print("Press Q to close the camera.")
 
     while True:
+        success, frame = camera.read()
 
-        ret, frame = cap.read()
-
-        if not ret or frame is None:
+        if not success:
             print("Failed to read camera frame.")
-            continue
+            break
 
-        # Mirror image
+        # Mirror camera like a selfie
         frame = cv2.flip(frame, 1)
 
         cv2.putText(
             frame,
-            "CAMERA TEST - Press Q to exit",
+            "MacBook Camera Test",
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
+            1,
             (0, 255, 0),
             2
         )
 
+        cv2.putText(
+            frame,
+            "Press Q to quit",
+            (20, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2
+        )
+
         cv2.imshow(
-            "MacBook Camera Test",
+            "Heart Rate Prediction - Camera Test",
             frame
         )
 
@@ -51,9 +60,8 @@ def test_camera():
         if key == ord("q"):
             break
 
-    cap.release()
-    cv2.destroyAllWindows()
+    camera.stop()
 
 
 if __name__ == "__main__":
-    test_camera()
+    main()
