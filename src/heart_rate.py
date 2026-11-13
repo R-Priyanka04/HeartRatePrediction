@@ -1,3 +1,4 @@
+
 import cv2
 import numpy as np
 import time
@@ -12,6 +13,8 @@ MAX_SIGNAL_SAMPLES = 300
 BPM_HISTORY_SIZE = 10
 
 green_signal = deque(maxlen=MAX_SIGNAL_SAMPLES)
+red_signal = deque(maxlen=MAX_SIGNAL_SAMPLES)
+blue_signal = deque(maxlen=MAX_SIGNAL_SAMPLES)
 timestamps = deque(maxlen=MAX_SIGNAL_SAMPLES)
 bpm_history = deque(maxlen=BPM_HISTORY_SIZE)
 
@@ -22,81 +25,100 @@ bpm_history = deque(maxlen=BPM_HISTORY_SIZE)
 
 def extract_forehead(frame, face_landmarks):
     """
-    Extract forehead region from MediaPipe face landmarks.
+    Extract forehead ROI using the shared MediaPipe ROI function.
     """
 
     if frame is None or face_landmarks is None:
         return np.array([])
 
-    h, w, _ = frame.shape
+    # Use the same ROI calculation as the standalone ROI test.
+    from src.eye_roi import get_landmark_forehead_box
 
-    # Forehead landmarks
-    landmark_ids = [10, 338, 297, 332, 284]
+    box = get_landmark_forehead_box(frame, face_landmarks)
 
-    points = []
-
-    for idx in landmark_ids:
-
-        lm = face_landmarks.landmark[idx]
-
-        x = int(lm.x * w)
-        y = int(lm.y * h)
-
-        points.append((x, y))
-
-    points = np.array(points, dtype=np.int32)
-
-    x, y, rw, rh = cv2.boundingRect(points)
-
-    # Use central part of forehead
-    x += int(rw * 0.20)
-    y += int(rh * 0.15)
-
-    rw = int(rw * 0.60)
-    rh = int(rh * 0.60)
-
-    # Image boundary protection
-    x = max(0, x)
-    y = max(0, y)
-
-    x2 = min(w, x + rw)
-    y2 = min(h, y + rh)
-
-    if x2 <= x or y2 <= y:
+    if box is None:
         return np.array([])
 
-    roi = frame[y:y2, x:x2]
+    x, y, width, height = box
 
-    return roi
+    if width <= 0 or height <= 0:
+        return np.array([])
+
+    return frame[y:y + height, x:x + width].copy()
 
 
 # ==========================================================
-# GREEN SIGNAL
+# EXTRACT RGB SIGNALS
 # ==========================================================
+
+def update_rgb_signal(roi):
+    """
+    Extract mean red, green, and blue channel intensities.
+
+    OpenCV stores colour channels in BGR order.
+    Returns a dictionary of channel means or None.
+    """
+
+    if roi is None or roi.size == 0:
+        return None
+
+    if roi.ndim != 3 or roi.shape[2] < 3:
+        return None
+
+    means = np.mean(roi[:, :, :3], axis=(0, 1))
+
+    # Reject invalid measurements.
+    if not np.all(np.isfinite(means)):
+        return None
+
+    blue_value = float(means[0])
+    green_value = float(means[1])
+    red_value = float(means[2])
+
+    sample_time = time.time()
+
+    # Keep channel buffers and timestamps synchronized.
+    blue_signal.append(blue_value)
+    green_signal.append(green_value)
+    red_signal.append(red_value)
+    timestamps.append(sample_time)
+
+    return {
+        "red": red_value,
+        "green": green_value,
+        "blue": blue_value,
+        "timestamp": sample_time,
+    }
+
 
 def update_signal(roi):
     """
-    Extract average green-channel intensity from forehead.
+    Backward-compatible green-channel update.
+
+    Existing dashboard code can continue calling update_signal().
     """
 
-    if roi is None:
+    sample = update_rgb_signal(roi)
+
+    if sample is None:
         return None
 
-    if roi.size == 0:
-        return None
+    return sample["green"]
 
-    # Green channel
-    green_channel = roi[:, :, 1]
 
-    value = float(np.mean(green_channel))
+# ==========================================================
+# SIGNAL ACCESS
+# ==========================================================
 
-    if not np.isfinite(value):
-        return None
+def get_rgb_signals():
+    """Return copies of the current RGB signals and timestamps."""
 
-    green_signal.append(value)
-    timestamps.append(time.time())
-
-    return value
+    return {
+        "red": np.asarray(red_signal, dtype=np.float64),
+        "green": np.asarray(green_signal, dtype=np.float64),
+        "blue": np.asarray(blue_signal, dtype=np.float64),
+        "timestamps": np.asarray(timestamps, dtype=np.float64),
+    }
 
 
 # ==========================================================
@@ -105,36 +127,24 @@ def update_signal(roi):
 
 def get_signal_quality():
     """
-    Estimate whether enough useful variation exists
-    in the green-channel signal.
-
-    Returns:
-        quality : POOR / FAIR / GOOD
-        score   : 0-100
+    Basic variation-based signal indicator.
+    This is not a validated physiological quality metric.
     """
 
     if len(green_signal) < 30:
         return "POOR", 0
 
-    signal = np.asarray(
-        green_signal,
-        dtype=np.float64
-    )
+    signal = np.asarray(green_signal, dtype=np.float64)
 
     if not np.all(np.isfinite(signal)):
         return "POOR", 0
 
-    variation = np.std(signal)
+    variation = float(np.std(signal))
 
-    # Very little variation
     if variation < 0.15:
         return "POOR", 20
-
-    # Moderate signal
     elif variation < 0.5:
         return "FAIR", 55
-
-    # Strong variation
     else:
         return "GOOD", 90
 
@@ -144,27 +154,18 @@ def get_signal_quality():
 # ==========================================================
 
 def check_roi_quality(roi):
-    """
-    Check whether forehead ROI is large enough
-    and has usable brightness.
-    """
+    """Check ROI dimensions and basic brightness."""
 
     if roi is None or roi.size == 0:
         return False, "No forehead detected"
 
     height, width = roi.shape[:2]
 
-    # ROI too small
     if width < 20 or height < 10:
         return False, "Move closer to camera"
 
     brightness = float(
-        np.mean(
-            cv2.cvtColor(
-                roi,
-                cv2.COLOR_BGR2GRAY
-            )
-        )
+        np.mean(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY))
     )
 
     if brightness < 40:
@@ -181,14 +182,9 @@ def check_roi_quality(roi):
 # ==========================================================
 
 def smooth_bpm(bpm):
-    """
-    Stabilize BPM using median of recent readings.
-    """
+    """Stabilize valid BPM readings using the median."""
 
-    if bpm is None:
-        return None
-
-    if not np.isfinite(bpm):
+    if bpm is None or not np.isfinite(bpm):
         return None
 
     if bpm < 40 or bpm > 180:
@@ -196,14 +192,7 @@ def smooth_bpm(bpm):
 
     bpm_history.append(float(bpm))
 
-    smoothed = np.median(
-        np.asarray(bpm_history)
-    )
-
-    return round(
-        float(smoothed),
-        1
-    )
+    return round(float(np.median(bpm_history)), 1)
 
 
 # ==========================================================
@@ -211,12 +200,7 @@ def smooth_bpm(bpm):
 # ==========================================================
 
 def get_bpm_status(bpm):
-    """
-    Basic display classification.
-
-    This is only an informational software label,
-    not a medical diagnosis.
-    """
+    """Informational software label, not a medical diagnosis."""
 
     if bpm is None:
         return "CALCULATING"
@@ -235,22 +219,14 @@ def get_bpm_status(bpm):
 # ==========================================================
 
 def get_measurement_progress(required_samples=180):
-    """
-    Return signal collection progress from 0 to 100.
-    """
+    """Return collection progress from 0 to 100."""
 
     if required_samples <= 0:
         return 100
 
-    progress = (
-        len(green_signal)
-        / required_samples
-    ) * 100
+    progress = len(green_signal) / required_samples * 100
 
-    return min(
-        100,
-        int(progress)
-    )
+    return min(100, int(progress))
 
 
 # ==========================================================
@@ -258,11 +234,11 @@ def get_measurement_progress(required_samples=180):
 # ==========================================================
 
 def reset_buffers():
-    """
-    Clear all measurements for a new session.
-    """
+    """Clear all signal buffers for a new measurement."""
 
     green_signal.clear()
+    red_signal.clear()
+    blue_signal.clear()
     timestamps.clear()
     bpm_history.clear()
 

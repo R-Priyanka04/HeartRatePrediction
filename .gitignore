@@ -8,3 +8,8 @@ Screenshots/
 logs/
 *.log
 .env
+
+# User accounts and private measurement history
+/data/*.db
+/data/*.sqlite
+/data/*.sqlite3

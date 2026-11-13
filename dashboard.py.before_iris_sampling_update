@@ -1,0 +1,2532 @@
+import time
+
+import cv2
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from src.camera import Camera
+from src.face_detection import FaceDetector
+from src.signal_processing import estimate_bpm, estimate_chrom_bpm
+
+
+# ============================================================
+# PAGE CONFIGURATION
+# ============================================================
+
+st.set_page_config(
+    page_title="Heart Rate AI",
+    page_icon="❤️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ============================================================
+# MEASUREMENT SETTINGS
+# ============================================================
+
+MIN_SAMPLES = 180
+MAX_SAMPLES = 300
+
+# BPM is calculated approximately once every second
+BPM_UPDATE_SECONDS = 1.0
+
+# Graph updates slower than camera to reduce flickering
+GRAPH_UPDATE_SECONDS = 0.75
+
+# Number of BPM candidates needed before locking
+LOCK_WINDOW = 6
+
+# Maximum standard deviation allowed for lock
+LOCK_STD_THRESHOLD = 4.0
+
+# Reject sudden BPM jumps
+MAX_BPM_JUMP = 20.0
+
+MIN_VALID_BPM = 45.0
+MAX_VALID_BPM = 180.0
+
+# Reset signal if face disappears too long
+FACE_LOST_RESET_SECONDS = 2.0
+
+
+# ============================================================
+# CSS
+# ============================================================
+
+st.markdown(
+    """
+<style>
+
+.stApp {
+    background:
+        radial-gradient(
+            circle at 25% 15%,
+            rgba(80,20,40,0.20),
+            transparent 25%
+        ),
+        linear-gradient(
+            135deg,
+            #07111c,
+            #061522
+        );
+}
+
+.block-container {
+    padding-top: 1.5rem;
+    padding-bottom: 2rem;
+    max-width: 1500px;
+}
+
+.main-title {
+    font-size: 42px;
+    font-weight: 800;
+    color: #f4f6fa;
+}
+
+.subtitle {
+    color: #9da9ba;
+    margin-bottom: 20px;
+}
+
+.system-ready {
+    color: #42e58d;
+    font-weight: 700;
+    text-align: right;
+    padding-top: 15px;
+}
+
+.bpm-card {
+    border: 1px solid rgba(255,80,110,.50);
+    border-radius: 22px;
+    padding: 30px 20px;
+    text-align: center;
+
+    background:
+        radial-gradient(
+            circle at 50% 0%,
+            rgba(255,70,100,.15),
+            rgba(15,20,36,.9)
+        );
+
+    min-height: 230px;
+}
+
+.bpm-number {
+    font-size: 62px;
+    font-weight: 800;
+    color: #ff6b87;
+    line-height: 1.1;
+}
+
+.bpm-unit {
+    color: #aab4c4;
+    font-size: 14px;
+    margin-top: 10px;
+}
+
+.badge {
+    display: inline-block;
+    margin-top: 18px;
+    padding: 7px 18px;
+    border-radius: 25px;
+    font-weight: 700;
+}
+
+.normal {
+    color: #43e58d;
+    border: 1px solid #2a9d63;
+    background: rgba(30,150,90,.15);
+}
+
+.low {
+    color: #42bfff;
+    border: 1px solid #267bad;
+    background: rgba(30,120,200,.15);
+}
+
+.high {
+    color: #ffb84d;
+    border: 1px solid #aa7525;
+    background: rgba(200,130,20,.15);
+}
+
+.waiting {
+    color: #ffd65a;
+    border: 1px solid #9e8428;
+    background: rgba(180,150,20,.12);
+}
+
+.locked {
+    color: #43e58d;
+    border: 1px solid #2a9d63;
+    background: rgba(30,150,90,.15);
+}
+
+.detected {
+    padding: 14px;
+    border-radius: 9px;
+    color: #51e696;
+    background: rgba(30,150,90,.25);
+}
+
+.not-detected {
+    padding: 14px;
+    border-radius: 9px;
+    color: #ffd35a;
+    background: rgba(200,140,20,.20);
+}
+
+.complete {
+    padding: 14px;
+    border-radius: 9px;
+    color: #51e696;
+    background: rgba(30,150,90,.25);
+    border: 1px solid rgba(70,220,140,.35);
+    font-weight: 700;
+}
+
+.stabilizing {
+    padding: 12px;
+    border-radius: 9px;
+    color: #ffd65a;
+    background: rgba(180,150,20,.12);
+    border: 1px solid rgba(200,170,50,.25);
+}
+
+section[data-testid="stSidebar"] {
+    background: #071522;
+}
+
+div[data-testid="stMetric"] {
+    background: rgba(10,22,35,.45);
+    padding: 15px;
+    border-radius: 12px;
+}
+
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+defaults = {
+
+    "running": False,
+
+    "camera": None,
+    "detector": None,
+
+    "signal_buffer": [],
+    "timestamp_buffer": [],
+    "rgb_buffer": [],
+
+    "candidate_bpms": [],
+
+    "raw_bpm": None,
+    "locked_bpm": None,
+    "bpm_locked": False,
+
+    "actual_fps": None,
+
+    "all_bpm": [],
+    "current_bpm": None,
+
+    "session_start": None,
+
+    "last_bpm_time": 0.0,
+    "last_graph_time": 0.0,
+
+    "last_face_time": 0.0,
+    "face_was_lost": False,
+
+    "iris_colour_history": {"LEFT IRIS": [], "RIGHT IRIS": []},
+
+    "history": [],
+}
+
+
+for key, value in defaults.items():
+
+    if key not in st.session_state:
+
+        st.session_state[key] = value
+
+
+# ============================================================
+# RESET MEASUREMENT
+# ============================================================
+
+def reset_measurement():
+
+    st.session_state.signal_buffer = []
+
+    st.session_state.timestamp_buffer = []
+
+    st.session_state.rgb_buffer = []
+
+    st.session_state.candidate_bpms = []
+
+    st.session_state.raw_bpm = None
+
+    st.session_state.locked_bpm = None
+
+    st.session_state.bpm_locked = False
+
+    st.session_state.actual_fps = None
+
+    st.session_state.current_bpm = None
+
+    st.session_state.all_bpm = []
+
+    st.session_state.history = []
+
+    st.session_state.iris_colour_history = {"LEFT IRIS": [], "RIGHT IRIS": []}
+
+    st.session_state.last_bpm_time = 0.0
+
+    st.session_state.last_graph_time = 0.0
+
+    st.session_state.last_face_time = (
+        time.perf_counter()
+    )
+
+    st.session_state.face_was_lost = False
+
+    st.session_state.session_start = None
+
+
+# ============================================================
+# CAMERA CLEANUP
+# ============================================================
+
+def close_camera():
+
+    camera = st.session_state.camera
+
+    if camera is None:
+        return
+
+    try:
+
+        if hasattr(camera, "close"):
+
+            camera.close()
+
+        elif hasattr(camera, "release"):
+
+            camera.release()
+
+        elif hasattr(camera, "cap"):
+
+            if camera.cap is not None:
+
+                camera.cap.release()
+
+    except Exception:
+
+        pass
+
+    st.session_state.camera = None
+
+
+# ============================================================
+# DETECTOR CLEANUP
+# ============================================================
+
+def close_detector():
+
+    detector = st.session_state.detector
+
+    if detector is None:
+        return
+
+    try:
+
+        detector.close()
+
+    except Exception:
+
+        pass
+
+    st.session_state.detector = None
+
+
+# ============================================================
+# ACTUAL FPS
+# ============================================================
+
+def calculate_actual_fps(timestamps):
+
+    if timestamps is None:
+
+        return None
+
+    if len(timestamps) < 30:
+
+        return None
+
+    times = np.asarray(
+        timestamps,
+        dtype=np.float64
+    )
+
+    differences = np.diff(times)
+
+    if len(differences) == 0:
+
+        return None
+
+    differences = differences[
+        (differences > 0.001)
+        &
+        (differences < 0.2)
+    ]
+
+    if len(differences) < 10:
+
+        return None
+
+    median_interval = np.median(
+        differences
+    )
+
+    if median_interval <= 0:
+
+        return None
+
+    fps = 1.0 / median_interval
+
+    if fps < 5 or fps > 120:
+
+        return None
+
+    return float(fps)
+
+
+# ============================================================
+# FOREHEAD ROI
+# ============================================================
+
+def get_forehead_roi(frame, face_landmarks):
+    """Locate both eyes, then place a wider pulse ROI above the eyebrows."""
+
+    if frame is None or face_landmarks is None:
+        return None
+
+    h, w = frame.shape[:2]
+    landmarks = face_landmarks.landmark
+
+    try:
+        # Eye contour landmarks from MediaPipe Face Mesh.
+        eye_ids = [33, 133, 159, 145, 362, 263, 386, 374]
+        eye_points = np.asarray([
+            (int(landmarks[i].x * w), int(landmarks[i].y * h))
+            for i in eye_ids
+        ], dtype=np.int32)
+
+        ex, ey, ew, eh = cv2.boundingRect(eye_points)
+
+        # Keep the forehead ROI clearly separated from the eye box.
+        eye_center_x = ex + ew // 2
+        roi_width = max(int(ew * 1.15), 50)
+        roi_height = max(int(eh * 2.0), 24)
+        gap = max(12, int(eh * 0.6))
+
+        x = eye_center_x - roi_width // 2
+        y = ey - gap - roi_height
+
+        x = max(0, x)
+        y = max(0, y)
+        x2 = min(w, x + roi_width)
+        y2 = min(h, y + roi_height)
+
+        # If the forehead ROI would be too short, reject it rather than
+        # accidentally sampling the eyes.
+        if x2 <= x or y2 <= y or (y2 - y) < int(roi_height * 0.65):
+            return None
+
+        roi = frame[y:y2, x:x2]
+        if roi.size == 0:
+            return None
+
+        return roi, x, y, x2, y2, (ex, ey, ex + ew, ey + eh)
+
+    except (IndexError, AttributeError, ValueError, TypeError):
+        return None
+
+
+# ============================================================
+# GREEN SIGNAL
+# ============================================================
+
+def extract_green_value(roi):
+
+    if roi is None:
+
+        return None
+
+    if roi.size == 0:
+
+        return None
+
+    green_channel = (
+        roi[:, :, 1]
+    )
+
+    value = float(
+        np.mean(
+            green_channel
+        )
+    )
+
+    if not np.isfinite(
+        value
+    ):
+
+        return None
+
+    return value
+
+
+# ============================================================
+# RGB SIGNAL (EXPERIMENTAL)
+# ============================================================
+
+def extract_rgb_values(roi):
+    """Return mean red, green, and blue values from the forehead ROI."""
+
+    if roi is None or roi.size == 0:
+        return None
+
+    # OpenCV frames use BGR channel order.
+    means = np.mean(roi, axis=(0, 1))
+
+    if len(means) < 3 or not np.isfinite(means[:3]).all():
+        return None
+
+    blue, green, red = map(float, means[:3])
+
+    return {
+        "red": red,
+        "green": green,
+        "blue": blue,
+    }
+
+
+# ============================================================
+# VALID BPM
+# ============================================================
+
+def is_valid_bpm(bpm):
+
+    if bpm is None:
+
+        return False
+
+    try:
+
+        bpm = float(
+            bpm
+        )
+
+    except Exception:
+
+        return False
+
+    if not np.isfinite(
+        bpm
+    ):
+
+        return False
+
+    if bpm < MIN_VALID_BPM:
+
+        return False
+
+    if bpm > MAX_VALID_BPM:
+
+        return False
+
+    return True
+
+
+# ============================================================
+# ADD BPM CANDIDATE
+# ============================================================
+
+def add_bpm_candidate(
+    raw_bpm
+):
+
+    if not is_valid_bpm(
+        raw_bpm
+    ):
+
+        return False
+
+    raw_bpm = float(
+        raw_bpm
+    )
+
+    candidates = (
+        st.session_state.candidate_bpms
+    )
+
+    # ========================================================
+    # JUMP REJECTION
+    # ========================================================
+
+    if len(candidates) >= 3:
+
+        recent = candidates[
+            -LOCK_WINDOW:
+        ]
+
+        recent_median = float(
+            np.median(
+                recent
+            )
+        )
+
+        difference = abs(
+            raw_bpm
+            -
+            recent_median
+        )
+
+        if difference > MAX_BPM_JUMP:
+
+            print(
+                "Rejected BPM jump: "
+                f"{recent_median:.1f} "
+                f"-> {raw_bpm:.1f}"
+            )
+
+            return False
+
+    candidates.append(
+        raw_bpm
+    )
+
+    if len(candidates) > 20:
+
+        candidates.pop(0)
+
+    return True
+
+
+# ============================================================
+# CHECK BPM LOCK
+# ============================================================
+
+def check_bpm_lock():
+
+    candidates = (
+        st.session_state.candidate_bpms
+    )
+
+    if len(candidates) < LOCK_WINDOW:
+
+        return None
+
+    recent = np.asarray(
+        candidates[
+            -LOCK_WINDOW:
+        ],
+        dtype=np.float64
+    )
+
+    if not np.all(
+        np.isfinite(recent)
+    ):
+
+        return None
+
+    median_bpm = float(
+        np.median(
+            recent
+        )
+    )
+
+    deviation = float(
+        np.std(
+            recent
+        )
+    )
+
+    bpm_range = float(
+        np.ptp(
+            recent
+        )
+    )
+
+    print(
+        "LOCK CHECK | "
+        f"Values="
+        f"{np.round(recent, 1).tolist()} | "
+        f"Median={median_bpm:.1f} | "
+        f"STD={deviation:.2f} | "
+        f"Range={bpm_range:.1f}"
+    )
+
+    if deviation <= LOCK_STD_THRESHOLD:
+
+        return round(
+            median_bpm,
+            1
+        )
+
+    return None
+
+
+# ============================================================
+# SIGNAL QUALITY
+# ============================================================
+
+def calculate_quality():
+
+    signal = (
+        st.session_state.signal_buffer
+    )
+
+    n = len(signal)
+
+    if n == 0:
+
+        return 0
+
+    if n < 60:
+
+        return 30
+
+    if n < 120:
+
+        return 50
+
+    if n < MIN_SAMPLES:
+
+        return 70
+
+    arr = np.asarray(
+        signal,
+        dtype=np.float64
+    )
+
+    if len(arr) < 20:
+
+        return 50
+
+    # Remove overall trend before judging signal variation
+
+    x = np.arange(
+        len(arr),
+        dtype=np.float64
+    )
+
+    try:
+
+        coefficients = np.polyfit(
+            x,
+            arr,
+            1
+        )
+
+        trend = np.polyval(
+            coefficients,
+            x
+        )
+
+        clean = (
+            arr
+            -
+            trend
+        )
+
+    except Exception:
+
+        clean = (
+            arr
+            -
+            np.mean(arr)
+        )
+
+    std = float(
+        np.std(clean)
+    )
+
+    if std < 0.05:
+
+        return 35
+
+    diff = np.diff(
+        clean
+    )
+
+    if len(diff) == 0:
+
+        return 40
+
+    motion = float(
+        np.std(diff)
+    )
+
+    relative_motion = (
+        motion
+        /
+        (std + 1e-8)
+    )
+
+    if relative_motion < 0.30:
+
+        return 95
+
+    if relative_motion < 0.50:
+
+        return 85
+
+    if relative_motion < 0.75:
+
+        return 70
+
+    if relative_motion < 1.0:
+
+        return 55
+
+    return 35
+
+
+# ============================================================
+# BPM CARD
+# ============================================================
+
+def get_bpm_status(bpm):
+    """
+    Return display category for BPM.
+    """
+
+    if bpm is None:
+        return "WAITING"
+
+    bpm = float(bpm)
+
+    if bpm < 60:
+        return "LOW"
+
+    if bpm <= 100:
+        return "NORMAL"
+
+    return "HIGH"
+
+
+def render_bpm(target_box):
+    """
+    Render the Current Heart Rate card.
+    """
+
+    # --------------------------------------------------------
+    # LOCKED BPM
+    # --------------------------------------------------------
+
+    if (
+        st.session_state.bpm_locked
+        and
+        st.session_state.locked_bpm is not None
+    ):
+
+        bpm = float(
+            st.session_state.locked_bpm
+        )
+
+        status = get_bpm_status(
+            bpm
+        )
+
+        bpm_text = f"{bpm:.1f}"
+
+        badge_class = (
+            f"badge {status.lower()}"
+        )
+
+        badge_text = (
+            f"🔒 LOCKED • {status}"
+        )
+
+    # --------------------------------------------------------
+    # RAW / STABILIZING BPM
+    # --------------------------------------------------------
+
+    elif (
+        st.session_state.raw_bpm
+        is not None
+    ):
+
+        bpm = float(
+            st.session_state.raw_bpm
+        )
+
+        status = get_bpm_status(
+            bpm
+        )
+
+        bpm_text = f"{bpm:.1f}"
+
+        badge_class = (
+            "badge waiting"
+        )
+
+        badge_text = (
+            f"● STABILIZING • {status}"
+        )
+
+    # --------------------------------------------------------
+    # NO BPM YET
+    # --------------------------------------------------------
+
+    else:
+
+        bpm_text = "--"
+
+        badge_class = (
+            "badge waiting"
+        )
+
+        if st.session_state.running:
+
+            badge_text = (
+                "● MEASURING"
+            )
+
+        else:
+
+            badge_text = (
+                "● READY"
+            )
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # HTML is intentionally constructed without indentation.
+    # This prevents Streamlit from displaying <div> as text.
+    # --------------------------------------------------------
+
+    html = (
+        '<div class="bpm-card">'
+        f'<div class="bpm-number">{bpm_text}</div>'
+        '<div class="bpm-unit">'
+        'BEATS PER MINUTE'
+        '</div>'
+        f'<span class="{badge_class}">'
+        f'{badge_text}'
+        '</span>'
+        '</div>'
+    )
+
+    target_box.markdown(
+        html,
+        unsafe_allow_html=True
+    )
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.markdown(
+        "## ❤️ Heart Rate AI"
+    )
+
+    st.caption(
+        "Contactless heart-rate estimation "
+        "using facial video and rPPG."
+    )
+
+    st.divider()
+
+    st.markdown(
+        "### Measurement Settings"
+    )
+
+    required_samples = st.slider(
+        "Required samples",
+        MIN_SAMPLES,
+        MAX_SAMPLES,
+        MIN_SAMPLES,
+        20,
+        help=(
+            "BPM estimation begins after this "
+            "number of samples."
+        )
+    )
+
+    show_roi = st.toggle(
+        "Show forehead ROI",
+        True
+    )
+
+    show_signal = st.toggle(
+        "Show live signal",
+        True
+    )
+
+    st.divider()
+
+    st.markdown(
+        "### Stability Settings"
+    )
+
+    st.caption(
+        f"Candidates required: {LOCK_WINDOW}"
+    )
+
+    st.caption(
+        f"Lock deviation: ≤ "
+        f"{LOCK_STD_THRESHOLD:.1f} BPM"
+    )
+
+    st.caption(
+        f"Jump rejection: "
+        f">{MAX_BPM_JUMP:.0f} BPM"
+    )
+
+    st.divider()
+
+    st.info(
+        """
+**For better readings**
+
+• Keep your head still  
+• Look directly at the camera  
+• Keep hands away from your face  
+• Use steady front lighting  
+• Avoid strong backlighting  
+• Wait until the BPM is locked
+"""
+    )
+
+
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+header_left, header_right = (
+    st.columns(
+        [5, 1]
+    )
+)
+
+with header_left:
+
+    st.markdown(
+        '<div class="main-title">'
+        '❤️ Heart Rate AI'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        '<div class="subtitle">'
+        'Real-Time Contactless Cardiovascular Monitoring'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
+
+with header_right:
+
+    st.markdown(
+        '<div class="system-ready">'
+        '● SYSTEM READY'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
+
+# ============================================================
+# CONTROL BUTTONS
+# ============================================================
+
+button1, button2, button3, _ = (
+    st.columns(
+        [1, 1, 1, 3]
+    )
+)
+
+
+with button1:
+
+    start = st.button(
+        "▶ Start",
+        type="primary",
+        width="stretch"
+    )
+
+
+with button2:
+
+    stop = st.button(
+        "■ Stop",
+        width="stretch"
+    )
+
+
+with button3:
+
+    reset = st.button(
+        "↻ New Measurement",
+        width="stretch"
+    )
+
+
+# ============================================================
+# BUTTON ACTIONS
+# ============================================================
+
+if reset:
+
+    st.session_state.running = False
+
+    close_camera()
+
+    close_detector()
+
+    reset_measurement()
+
+
+if stop:
+
+    st.session_state.running = False
+
+    close_camera()
+
+    close_detector()
+
+
+if (
+    start
+    and
+    not st.session_state.running
+):
+
+    close_camera()
+
+    close_detector()
+
+    reset_measurement()
+
+    camera = Camera()
+
+    detector = FaceDetector()
+
+    try:
+
+        opened = camera.open()
+
+    except Exception as e:
+
+        opened = False
+
+        st.error(
+            f"Camera error: {e}"
+        )
+
+    if opened:
+
+        st.session_state.camera = (
+            camera
+        )
+
+        st.session_state.detector = (
+            detector
+        )
+
+        st.session_state.running = True
+
+        st.session_state.session_start = (
+            time.time()
+        )
+
+        st.session_state.last_face_time = (
+            time.perf_counter()
+        )
+
+    else:
+
+        st.error(
+            "Could not open camera."
+        )
+
+        try:
+
+            detector.close()
+
+        except Exception:
+
+            pass
+
+
+# ============================================================
+# MAIN DASHBOARD LAYOUT
+# ============================================================
+
+left, right = st.columns(
+    [1.7, 1],
+    gap="medium"
+)
+
+
+# ============================================================
+# CAMERA COLUMN
+# ============================================================
+
+with left:
+
+    st.markdown(
+        "### 📷 Live Camera"
+    )
+
+    camera_box = st.empty()
+
+    camera_status = st.empty()
+
+
+# ============================================================
+# BPM COLUMN
+# ============================================================
+
+with right:
+
+    st.markdown(
+        "### ❤️ Current Heart Rate"
+    )
+
+    bpm_box = st.empty()
+
+    measurement_status_box = (
+        st.empty()
+    )
+
+    quality_box = st.empty()
+
+    progress_text = st.empty()
+
+    progress_bar = st.empty()
+
+
+render_bpm(
+    bpm_box
+)
+
+
+# ============================================================
+# SIGNAL GRAPH
+# ============================================================
+
+st.divider()
+
+st.markdown(
+    "### 📈 Live Pulse Signal"
+)
+
+graph_box = st.empty()
+
+
+# ============================================================
+# DIAGNOSTICS
+# ============================================================
+
+st.markdown(
+    "### 🔬 Measurement Diagnostics"
+)
+
+d1, d2, d3, d4 = st.columns(4)
+
+fps_box = d1.empty()
+
+samples_box = d2.empty()
+
+candidate_box = d3.empty()
+
+raw_box = d4.empty()
+
+
+# ============================================================
+# SESSION STATISTICS
+# ============================================================
+
+st.markdown(
+    "### 📊 Session Statistics"
+)
+
+m1, m2, m3, m4 = (
+    st.columns(4)
+)
+
+avg_box = m1.empty()
+
+min_box = m2.empty()
+
+max_box = m3.empty()
+
+time_box = m4.empty()
+
+
+# ============================================================
+# HISTORY
+# ============================================================
+
+st.divider()
+
+st.markdown(
+    "### 📝 Measurement History"
+)
+
+history_box = st.empty()
+
+
+# ============================================================
+# UPDATE STATISTICS
+# ============================================================
+
+def update_statistics():
+
+    values = (
+        st.session_state.all_bpm
+    )
+
+    if values:
+
+        avg_box.metric(
+            "Average BPM",
+            f"{np.mean(values):.1f}"
+        )
+
+        min_box.metric(
+            "Minimum BPM",
+            f"{np.min(values):.1f}"
+        )
+
+        max_box.metric(
+            "Maximum BPM",
+            f"{np.max(values):.1f}"
+        )
+
+    else:
+
+        avg_box.metric(
+            "Average BPM",
+            "—"
+        )
+
+        min_box.metric(
+            "Minimum BPM",
+            "—"
+        )
+
+        max_box.metric(
+            "Maximum BPM",
+            "—"
+        )
+
+    if (
+        st.session_state.session_start
+        is not None
+    ):
+
+        duration = int(
+            time.time()
+            -
+            st.session_state.session_start
+        )
+
+    else:
+
+        duration = 0
+
+    time_box.metric(
+        "Session",
+        f"{duration} sec"
+    )
+
+
+# ============================================================
+# UPDATE QUALITY / PROGRESS
+# ============================================================
+
+def update_quality():
+
+    count = len(
+        st.session_state.signal_buffer
+    )
+
+    quality = (
+        calculate_quality()
+    )
+
+    if quality >= 80:
+
+        label = "GOOD"
+
+    elif quality >= 50:
+
+        label = "FAIR"
+
+    else:
+
+        label = "LOW"
+
+    quality_box.markdown(
+        f"**Signal Quality:** "
+        f"{label} • {quality}%"
+    )
+
+    # Once minimum samples are collected, progress represents
+    # stabilization instead of raw sample collection.
+
+    if count < required_samples:
+
+        progress = min(
+            count / required_samples,
+            1.0
+        )
+
+        progress_text.caption(
+            f"Signal collection: "
+            f"{count}/{required_samples} samples"
+        )
+
+    elif not st.session_state.bpm_locked:
+
+        candidate_count = len(
+            st.session_state.candidate_bpms
+        )
+
+        progress = min(
+            candidate_count
+            /
+            LOCK_WINDOW,
+            1.0
+        )
+
+        progress_text.caption(
+            f"BPM stabilization: "
+            f"{candidate_count}/{LOCK_WINDOW} "
+            f"accepted estimates"
+        )
+
+    else:
+
+        progress = 1.0
+
+        progress_text.caption(
+            "✓ Measurement complete"
+        )
+
+    progress_bar.progress(
+        float(progress)
+    )
+
+
+# ============================================================
+# UPDATE GRAPH
+# ============================================================
+
+def update_graph():
+
+    if not show_signal:
+
+        graph_box.info(
+            "Live signal display disabled."
+        )
+
+        return
+
+    signal = (
+        st.session_state.signal_buffer
+    )
+
+    if len(signal) < 2:
+
+        graph_box.info(
+            "Waiting for pulse signal..."
+        )
+
+        return
+
+    # Keep only recent data
+    recent_signal = signal[
+        -MAX_SAMPLES:
+    ]
+
+    df = pd.DataFrame(
+        {
+            "Green Intensity":
+                recent_signal
+        }
+    )
+
+    graph_box.line_chart(
+        df,
+        height=270,
+        width="stretch"
+    )
+
+
+# ============================================================
+# UPDATE HISTORY
+# ============================================================
+
+def update_history():
+
+    history = (
+        st.session_state.history
+    )
+
+    if not history:
+
+        history_box.info(
+            "No completed BPM measurement yet."
+        )
+
+        return
+
+    df = pd.DataFrame(
+        history[-20:]
+    )
+
+    history_box.dataframe(
+        df,
+        width="stretch",
+        hide_index=True
+    )
+
+
+# ============================================================
+# UPDATE DIAGNOSTICS
+# ============================================================
+
+def update_diagnostics():
+
+    fps = (
+        st.session_state.actual_fps
+    )
+
+    if fps is None:
+
+        fps_value = "—"
+
+    else:
+
+        fps_value = (
+            f"{fps:.1f}"
+        )
+
+    fps_box.metric(
+        "Actual FPS",
+        fps_value
+    )
+
+    samples_box.metric(
+        "Samples",
+        len(
+            st.session_state.signal_buffer
+        )
+    )
+
+    candidate_box.metric(
+        "Stable Candidates",
+        (
+            f"{min(len(st.session_state.candidate_bpms), LOCK_WINDOW)}"
+            f"/{LOCK_WINDOW}"
+        )
+    )
+
+    raw = (
+        st.session_state.raw_bpm
+    )
+
+    if raw is None:
+
+        raw_value = "—"
+
+    else:
+
+        raw_value = (
+            f"{raw:.1f}"
+        )
+
+    raw_box.metric(
+        "Raw BPM",
+        raw_value
+    )
+
+
+# ============================================================
+# INITIAL DISPLAY
+# ============================================================
+
+update_statistics()
+
+update_quality()
+
+update_graph()
+
+update_history()
+
+update_diagnostics()
+
+
+if not st.session_state.running:
+
+    if st.session_state.bpm_locked:
+
+        camera_box.success(
+            "Measurement complete. "
+            "Click New Measurement to measure again."
+        )
+
+    else:
+
+        camera_box.info(
+            "Camera stopped. "
+            "Click Start to begin."
+        )
+
+
+# ============================================================
+# LIVE MEASUREMENT
+# ============================================================
+
+if st.session_state.running:
+
+    camera = (
+        st.session_state.camera
+    )
+
+    detector = (
+        st.session_state.detector
+    )
+
+    while st.session_state.running:
+
+        # ====================================================
+        # READ CAMERA
+        # ====================================================
+
+        success, frame = (
+            camera.read()
+        )
+
+        if not success:
+
+            time.sleep(
+                0.02
+            )
+
+            continue
+
+        current_time = (
+            time.perf_counter()
+        )
+
+        frame = cv2.flip(
+            frame,
+            1
+        )
+
+        # ====================================================
+        # FACE DETECTION
+        # ====================================================
+
+        try:
+
+            face_landmarks = (
+                detector.detect(
+                    frame
+                )
+            )
+
+        except Exception as e:
+
+            face_landmarks = None
+
+            print(
+                "Face detection error:",
+                e
+            )
+
+        roi_found = False
+
+        green_value = None
+
+        # ====================================================
+        # FOREHEAD ROI
+        # ====================================================
+
+        if face_landmarks is not None:
+
+            roi_result = (
+                get_forehead_roi(
+                    frame,
+                    face_landmarks
+                )
+            )
+
+            if roi_result is not None:
+
+                (
+                    roi,
+                    x,
+                    y,
+                    x2,
+                    y2,
+                    eye_box
+                ) = roi_result
+
+                roi_found = True
+
+                st.session_state.last_face_time = (
+                    current_time
+                )
+
+                st.session_state.face_was_lost = (
+                    False
+                )
+
+                # ============================================
+                # IRIS DETECTION AND APPROXIMATE COLOUR ESTIMATION
+                # ============================================
+                landmarks = face_landmarks.landmark
+                frame_h, frame_w = frame.shape[:2]
+
+                iris_groups = {
+                    "LEFT IRIS": [474, 475, 476, 477],
+                    "RIGHT IRIS": [469, 470, 471, 472],
+                }
+
+                # Put labels in separate rows above the eyes.
+                label_rows = {
+                    "LEFT IRIS": 28,
+                    "RIGHT IRIS": 48,
+                }
+
+                for eye_name, indices in iris_groups.items():
+                    try:
+                        points = np.asarray([
+                            (
+                                int(landmarks[idx].x * frame_w),
+                                int(landmarks[idx].y * frame_h)
+                            )
+                            for idx in indices
+                        ], dtype=np.int32)
+
+                        cx = int(np.mean(points[:, 0]))
+                        cy = int(np.mean(points[:, 1]))
+
+                        # Approximate iris radius from its landmark spread.
+                        distances = np.linalg.norm(
+                            points - np.array([cx, cy]), axis=1
+                        )
+                        radius = max(2, int(np.max(distances) * 0.85))
+
+                        # Sample a central circular region, not a square
+                        # containing as much surrounding eyelid/skin.
+                        yy, xx = np.ogrid[
+                            max(0, cy - radius):min(frame_h, cy + radius + 1),
+                            max(0, cx - radius):min(frame_w, cx + radius + 1)
+                        ]
+
+                        x1 = max(0, cx - radius)
+                        y1 = max(0, cy - radius)
+                        x2 = min(frame_w, cx + radius + 1)
+                        y2 = min(frame_h, cy + radius + 1)
+
+                        crop = frame[y1:y2, x1:x2]
+                        if crop.size == 0:
+                            continue
+
+                        mask = (
+                            (xx - cx) ** 2 + (yy - cy) ** 2
+                            <= radius ** 2
+                        )
+
+                        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+                        pixels = hsv[mask]
+
+                        # Remove very dark pupil pixels and bright reflections.
+                        pixels = pixels[
+                            (pixels[:, 2] >= 35) &
+                            (pixels[:, 2] <= 235) &
+                            (pixels[:, 1] >= 25)
+                        ]
+
+                        colour = "UNCLEAR"
+
+                        # A webcam crop this small is not always sufficient
+                        # for a trustworthy iris-colour estimate.
+                        if len(pixels) >= 5:
+                            hue = float(np.median(pixels[:, 0]))
+                            sat = float(np.median(pixels[:, 1]))
+                            val = float(np.median(pixels[:, 2]))
+
+                            if sat < 35:
+                                colour = "UNCLEAR"
+                            elif hue < 10 or hue >= 170:
+                                colour = "BROWN/AMBER"
+                            elif hue < 20:
+                                colour = "BROWN"
+                            elif hue < 35:
+                                colour = "HAZEL/BROWN"
+                            elif hue < 85:
+                                colour = "GREENISH"
+                            elif hue < 130:
+                                colour = "BLUISH"
+                            else:
+                                colour = "UNCLEAR"
+
+                        # Stabilise each eye independently over recent valid frames.
+                        history = st.session_state.iris_colour_history[eye_name]
+                        if colour != "UNCLEAR":
+                            history.append(colour)
+                            del history[:-15]
+
+                        if history:
+                            counts = {name: history.count(name) for name in set(history)}
+                            colour = max(counts, key=counts.get)
+                        else:
+                            colour = "UNCLEAR"
+
+                        if show_roi:
+                            cv2.circle(
+                                frame, (cx, cy), radius,
+                                (255, 255, 0), 2
+                            )
+
+                            # Update each eye's label, but draw the panel only once.
+                            display_colours = st.session_state.setdefault(
+                                "iris_display_colours",
+                                {"LEFT IRIS": "DETECTING", "RIGHT IRIS": "DETECTING"}
+                            )
+                            display_colours[eye_name] = colour
+
+                            if eye_name == "RIGHT IRIS":
+                                font = cv2.FONT_HERSHEY_SIMPLEX
+                                scale = 0.46
+                                thickness = 1
+                                rows = [
+                                    f"LEFT IRIS: {display_colours['LEFT IRIS']}",
+                                    f"RIGHT IRIS: {display_colours['RIGHT IRIS']}"
+                                ]
+                                sizes = [
+                                    cv2.getTextSize(row, font, scale, thickness)[0]
+                                    for row in rows
+                                ]
+                                panel_w = max(size[0] for size in sizes) + 18
+                                px = max(8, frame_w - panel_w - 12)
+                                py = 12
+                                cv2.rectangle(
+                                    frame, (px, py), (px + panel_w, py + 58),
+                                    (20, 20, 20), -1
+                                )
+                                cv2.rectangle(
+                                    frame, (px, py), (px + panel_w, py + 58),
+                                    (255, 255, 0), 1
+                                )
+                                for i, row in enumerate(rows):
+                                    cv2.putText(
+                                        frame, row, (px + 8, py + 23 + i * 22),
+                                        font, scale, (255, 255, 0),
+                                        thickness, cv2.LINE_AA
+                                    )
+
+                    except (IndexError, ValueError, cv2.error):
+                        continue
+
+                # DRAW FOREHEAD ROI
+                # ============================================
+
+                if show_roi:
+
+                    ex, ey, ex2, ey2 = eye_box
+                    cv2.rectangle(
+                        frame,
+                        (ex, ey),
+                        (ex2, ey2),
+                        (255, 0, 0),
+                        2
+                    )
+                    cv2.putText(
+                        frame,
+                        "EYES DETECTED",
+                        (ex, min(frame.shape[0] - 10, ey2 + 22)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255, 0, 0),
+                        2
+                    )
+
+                    # Wider, centred forehead DISPLAY box only.
+                    frame_h, frame_w = frame.shape[:2]
+                    eye_width = max(1, ex2 - ex)
+                    forehead_left = max(0, ex - int(0.12 * eye_width))
+                    forehead_right = min(frame_w - 1, ex2 + int(0.12 * eye_width))
+                    forehead_top = max(0, ey - int(0.85 * eye_width))
+                    forehead_bottom = max(forehead_top + 1, ey - 8)
+
+                    cv2.rectangle(
+                        frame,
+                        (forehead_left, forehead_top),
+                        (forehead_right, forehead_bottom),
+                        (0, 255, 0),
+                        2
+                    )
+
+                    forehead_label = "FOREHEAD ROI"
+                    (label_w, label_h), _ = cv2.getTextSize(
+                        forehead_label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
+                    )
+                    forehead_label_x = max(
+                        5, min(frame_w - label_w - 5,
+                               (forehead_left + forehead_right - label_w) // 2)
+                    )
+                    forehead_label_y = max(22, forehead_top - 8)
+
+                    cv2.putText(
+                        frame,
+                        forehead_label,
+                        (forehead_label_x, forehead_label_y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA
+                    )
+
+                # ============================================
+                # GREEN CHANNEL
+                # ============================================
+
+                green_value = (
+                    extract_green_value(
+                        roi
+                    )
+                )
+
+                rgb_value = extract_rgb_values(roi)
+
+                # ============================================
+                # COLLECT SIGNAL ONLY UNTIL BPM LOCKS
+                # ============================================
+
+                if (
+                    green_value is not None
+                    and
+                    not st.session_state.bpm_locked
+                ):
+
+                    st.session_state.signal_buffer.append(
+                        green_value
+                    )
+
+                    st.session_state.rgb_buffer.append(rgb_value)
+
+                    st.session_state.timestamp_buffer.append(
+                        current_time
+                    )
+
+                    if (
+                        len(
+                            st.session_state.signal_buffer
+                        )
+                        >
+                        MAX_SAMPLES
+                    ):
+
+                        st.session_state.signal_buffer.pop(
+                            0
+                        )
+
+                        st.session_state.timestamp_buffer.pop(0)
+
+                        if st.session_state.rgb_buffer:
+                            st.session_state.rgb_buffer.pop(0)
+
+        # ====================================================
+        # FACE LOST HANDLING
+        # ====================================================
+
+        if (
+            not roi_found
+            and
+            not st.session_state.bpm_locked
+        ):
+
+            lost_duration = (
+                current_time
+                -
+                st.session_state.last_face_time
+            )
+
+            if (
+                lost_duration
+                >
+                FACE_LOST_RESET_SECONDS
+                and
+                not st.session_state.face_was_lost
+            ):
+
+                print(
+                    "Face lost too long. "
+                    "Signal measurement reset."
+                )
+
+                st.session_state.signal_buffer = []
+
+                st.session_state.timestamp_buffer = []
+
+                st.session_state.rgb_buffer = []
+
+                st.session_state.candidate_bpms = []
+
+                st.session_state.raw_bpm = None
+
+                st.session_state.actual_fps = None
+
+                st.session_state.last_bpm_time = 0.0
+
+                st.session_state.face_was_lost = (
+                    True
+                )
+
+        # ====================================================
+        # ACTUAL TIMESTAMP FPS
+        # ====================================================
+
+        if not st.session_state.bpm_locked:
+
+            st.session_state.actual_fps = (
+                calculate_actual_fps(
+                    st.session_state.timestamp_buffer
+                )
+            )
+
+        # ====================================================
+        # DRAW CAMERA INFORMATION
+        # ====================================================
+
+        sample_count = len(
+            st.session_state.signal_buffer
+        )
+
+        cv2.putText(
+            frame,
+            (
+                f"Samples: "
+                f"{sample_count}/"
+                f"{required_samples}"
+            ),
+            (25, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2
+        )
+
+        # Smooth displayed parameters only; keep raw measurements unchanged.
+        if "display_fps_smooth" not in st.session_state:
+            st.session_state.display_fps_smooth = None
+        if "display_green_smooth" not in st.session_state:
+            st.session_state.display_green_smooth = None
+
+        actual_fps = st.session_state.actual_fps
+        if actual_fps is not None:
+            previous_fps = st.session_state.display_fps_smooth
+            st.session_state.display_fps_smooth = (
+                actual_fps if previous_fps is None
+                else 0.15 * actual_fps + 0.85 * previous_fps
+            )
+            actual_fps = st.session_state.display_fps_smooth
+
+        if green_value is not None:
+            previous_green = st.session_state.display_green_smooth
+            st.session_state.display_green_smooth = (
+                green_value if previous_green is None
+                else 0.15 * green_value + 0.85 * previous_green
+            )
+            green_value = st.session_state.display_green_smooth
+
+        if actual_fps is not None:
+
+            cv2.putText(
+                frame,
+                (
+                    f"FPS: "
+                    f"{actual_fps:.1f}"
+                ),
+                (25, 70),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 220, 0),
+                2
+            )
+
+        if green_value is not None:
+
+            cv2.putText(
+                frame,
+                (
+                    f"Green: "
+                    f"{green_value:.2f}"
+                ),
+                (25, 100),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 255),
+                2
+            )
+
+        # ====================================================
+        # BPM ESTIMATION
+        # ====================================================
+
+        now = time.time()
+
+        if (
+            not st.session_state.bpm_locked
+            and
+            len(
+                st.session_state.signal_buffer
+            )
+            >=
+            required_samples
+            and
+            st.session_state.actual_fps
+            is not None
+            and
+            (
+                now
+                -
+                st.session_state.last_bpm_time
+            )
+            >=
+            BPM_UPDATE_SECONDS
+        ):
+
+            # ================================================
+            # ESTIMATE RAW BPM
+            # ================================================
+
+            try:
+
+                estimated_bpm = (
+                    estimate_bpm(
+                        st.session_state.signal_buffer,
+                        st.session_state.actual_fps
+                    )
+                )
+
+                # Experimental CHROM comparison; green remains the live estimate.
+                chrom_bpm = estimate_chrom_bpm(
+                    st.session_state.rgb_buffer,
+                    st.session_state.actual_fps
+                )
+
+                if chrom_bpm is not None:
+                    print(
+                        f"EXPERIMENTAL CHROM BPM={chrom_bpm:.1f} | "
+                        f"GREEN BPM={estimated_bpm}"
+                    )
+
+            except Exception as e:
+
+                print(
+                    "estimate_bpm ERROR:",
+                    repr(e)
+                )
+
+                estimated_bpm = None
+
+            # ================================================
+            # DIAGNOSTICS
+            # ================================================
+
+            arr = np.asarray(
+                st.session_state.signal_buffer,
+                dtype=np.float64
+            )
+
+            if estimated_bpm is None:
+
+                st.session_state.raw_bpm = (
+                    None
+                )
+
+                print(
+                    "Estimator returned None | "
+                    f"FPS="
+                    f"{st.session_state.actual_fps:.2f} | "
+                    f"Samples={len(arr)} | "
+                    f"Mean={np.mean(arr):.2f} | "
+                    f"STD={np.std(arr):.4f} | "
+                    f"Range={np.ptp(arr):.4f}"
+                )
+
+            else:
+
+                raw_bpm = float(
+                    estimated_bpm
+                )
+
+                st.session_state.raw_bpm = (
+                    raw_bpm
+                )
+
+                print(
+                    f"Raw BPM={raw_bpm:.1f} | "
+                    f"FPS="
+                    f"{st.session_state.actual_fps:.2f} | "
+                    f"Samples={len(arr)} | "
+                    f"STD={np.std(arr):.4f} | "
+                    f"Range={np.ptp(arr):.4f}"
+                )
+
+                # ============================================
+                # ADD CANDIDATE
+                # ============================================
+
+                accepted = (
+                    add_bpm_candidate(
+                        raw_bpm
+                    )
+                )
+
+                if accepted:
+
+                    print(
+                        "Accepted BPM | "
+                        f"Candidates="
+                        f"{len(st.session_state.candidate_bpms)}"
+                    )
+
+                    # ========================================
+                    # CHECK LOCK
+                    # ========================================
+
+                    possible_lock = (
+                        check_bpm_lock()
+                    )
+
+                    if possible_lock is not None:
+
+                        st.session_state.locked_bpm = (
+                            possible_lock
+                        )
+
+                        st.session_state.current_bpm = (
+                            possible_lock
+                        )
+
+                        st.session_state.bpm_locked = (
+                            True
+                        )
+
+                        # Store one final BPM measurement
+                        st.session_state.all_bpm.append(
+                            possible_lock
+                        )
+
+                        st.session_state.history.append(
+                            {
+                                "Time":
+                                    time.strftime(
+                                        "%H:%M:%S"
+                                    ),
+
+                                "BPM":
+                                    round(
+                                        possible_lock,
+                                        1
+                                    ),
+
+                                "Signal Quality":
+                                    f"{calculate_quality()}%",
+
+                                "Status":
+                                    (
+                                        "LOW"
+                                        if possible_lock < 60
+                                        else
+                                        "NORMAL"
+                                        if possible_lock <= 100
+                                        else
+                                        "HIGH"
+                                    )
+                            }
+                        )
+
+                        print()
+
+                        print(
+                            "=" * 55
+                        )
+
+                        print(
+                            "MEASUREMENT COMPLETE"
+                        )
+
+                        print(
+                            "FINAL LOCKED BPM: "
+                            f"{possible_lock:.1f}"
+                        )
+
+                        print(
+                            "=" * 55
+                        )
+
+                        print()
+
+            st.session_state.last_bpm_time = (
+                now
+            )
+
+        # ====================================================
+        # CAMERA OVERLAY - BPM STATE
+        # ====================================================
+
+        if st.session_state.bpm_locked:
+
+            locked = (
+                st.session_state.locked_bpm
+            )
+
+            cv2.putText(
+                frame,
+                (
+                    f"BPM: "
+                    f"{locked:.1f}"
+                ),
+                (25, 140),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                "MEASUREMENT COMPLETE",
+                (25, 175),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 0),
+                2
+            )
+
+        elif (
+            len(
+                st.session_state.signal_buffer
+            )
+            <
+            required_samples
+        ):
+
+            cv2.putText(
+                frame,
+                "BPM: Collecting signal...",
+                (25, 140),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 255),
+                2
+            )
+
+        elif len(
+            st.session_state.candidate_bpms
+        ) == 0:
+
+            cv2.putText(
+                frame,
+                "BPM: Analyzing...",
+                (25, 140),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 255),
+                2
+            )
+
+        else:
+
+            candidate_progress = min(
+                len(
+                    st.session_state.candidate_bpms
+                ),
+                LOCK_WINDOW
+            )
+
+            cv2.putText(
+                frame,
+                (
+                    "BPM: Stabilizing "
+                    f"{candidate_progress}/"
+                    f"{LOCK_WINDOW}"
+                ),
+                (25, 140),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 255),
+                2
+            )
+
+        # ====================================================
+        # DISPLAY CAMERA
+        # ====================================================
+
+        rgb_frame = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2RGB
+        )
+
+        camera_box.image(
+            rgb_frame,
+            channels="RGB",
+            width="stretch"
+        )
+
+        # ====================================================
+        # CAMERA STATUS
+        # ====================================================
+
+        if st.session_state.bpm_locked:
+
+            camera_status.markdown(
+                '<div class="complete">'
+                '✓ Measurement complete • '
+                'BPM successfully locked'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+        elif roi_found:
+
+            camera_status.markdown(
+                '<div class="detected">'
+                '● Forehead detected • '
+                'Signal collecting'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+        else:
+
+            camera_status.markdown(
+                '<div class="not-detected">'
+                '● Face/forehead not detected • '
+                'Look directly at the camera'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+        # ====================================================
+        # MEASUREMENT STATUS
+        # ====================================================
+
+        if st.session_state.bpm_locked:
+
+            measurement_status_box.markdown(
+                '<div class="complete">'
+                '✓ MEASUREMENT COMPLETE<br>'
+                'Final heart rate has been locked.'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+        elif len(
+            st.session_state.signal_buffer
+        ) < required_samples:
+
+            measurement_status_box.markdown(
+                '<div class="stabilizing">'
+                'Collecting pulse signal...'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+        elif len(
+            st.session_state.candidate_bpms
+        ) < LOCK_WINDOW:
+
+            count = len(
+                st.session_state.candidate_bpms
+            )
+
+            measurement_status_box.markdown(
+                (
+                    '<div class="stabilizing">'
+                    'Stabilizing heart rate... '
+                    f'{count}/{LOCK_WINDOW}'
+                    '</div>'
+                ),
+                unsafe_allow_html=True
+            )
+
+        # ====================================================
+        # UPDATE BPM CARD
+        # ====================================================
+
+        render_bpm(
+            bpm_box
+        )
+
+        update_quality()
+
+        update_statistics()
+
+        update_diagnostics()
+
+        # ====================================================
+        # GRAPH / HISTORY
+        # ====================================================
+
+        if (
+            now
+            -
+            st.session_state.last_graph_time
+            >=
+            GRAPH_UPDATE_SECONDS
+        ):
+
+            update_graph()
+
+            update_history()
+
+            st.session_state.last_graph_time = (
+                now
+            )
+
+        # ====================================================
+        # CPU CONTROL
+        # ====================================================
+
+        time.sleep(
+            0.02
+        )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.divider()
+
+st.caption(
+    "Heart Rate AI • Contactless rPPG Monitoring • "
+    "Educational and Research Prototype"
+)

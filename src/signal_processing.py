@@ -639,3 +639,71 @@ def calculate_signal_quality(
         quality = 25.0
 
     return quality
+
+
+# ============================================================
+# EXPERIMENTAL CHROM rPPG ESTIMATOR
+# ============================================================
+
+def estimate_chrom_bpm(rgb_samples, fps):
+    """
+    Estimate BPM using the CHROM chrominance method.
+
+    rgb_samples: sequence of dictionaries containing
+                 red, green, and blue mean ROI values.
+    fps: measured camera frame rate.
+
+    Experimental only; the existing estimate_bpm() is unchanged.
+    """
+
+    if rgb_samples is None or fps is None:
+        return None
+
+    if len(rgb_samples) < 120:
+        return None
+
+    try:
+        rgb = np.array(
+            [[s["red"], s["green"], s["blue"]]
+             for s in rgb_samples],
+            dtype=np.float64
+        )
+        fps = float(fps)
+    except (TypeError, ValueError, KeyError, IndexError):
+        return None
+
+    if not np.all(np.isfinite(rgb)):
+        return None
+
+    if not 5 <= fps <= 120:
+        return None
+
+    # Normalize each colour channel by its temporal mean.
+    channel_means = np.mean(rgb, axis=0)
+
+    if np.any(channel_means <= 1e-8):
+        return None
+
+    normalized = rgb / channel_means - 1.0
+
+    # CHROM chrominance projections.
+    x_signal = 3.0 * normalized[:, 0] - 2.0 * normalized[:, 1]
+    y_signal = 1.5 * normalized[:, 0] + normalized[:, 1] - 1.5 * normalized[:, 2]
+
+    x_signal = bandpass_filter(x_signal, fps)
+    y_signal = bandpass_filter(y_signal, fps)
+
+    if x_signal is None or y_signal is None:
+        return None
+
+    std_x = float(np.std(x_signal))
+    std_y = float(np.std(y_signal))
+
+    if std_x < 1e-8 or std_y < 1e-8:
+        return None
+
+    alpha = std_x / std_y
+    chrom_signal = x_signal - alpha * y_signal
+
+    return estimate_bpm(chrom_signal, fps)
+

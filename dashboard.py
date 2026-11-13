@@ -15,7 +15,7 @@ from src.signal_processing import estimate_bpm, estimate_chrom_bpm
 # ============================================================
 
 st.set_page_config(
-    page_title="Heart Rate AI",
+    page_title="PulseVision",
     page_icon="♥",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -56,56 +56,22 @@ FACE_LOST_RESET_SECONDS = 2.0
 # ============================================================
 
 THEMES = {
-    "Ocean": {
-        "page": "#eef6f8", "sidebar": "#dceef1", "surface": "#ffffff",
-        "text": "#183344", "muted": "#526b78", "primary": "#087f8c",
-        "accent": "#13a89e", "border": "#c9e0e5", "bpm_bg": "#e2f5f3",
-        "bpm": "#087f8c", "info_bg": "#dceefb", "info_text": "#164f82",
+    "Light": {
+        "page": "#f4f7fb", "sidebar": "#ffffff", "surface": "#ffffff",
+        "text": "#202940", "muted": "#65718a", "primary": "#536dfe",
+        "accent": "#8b9cff", "border": "#dfe5f0", "bpm_bg": "#edf0ff",
+        "bpm": "#4058db", "info_bg": "#e8efff", "info_text": "#304b91",
     },
-    "Midnight": {
-        "page": "#111827", "sidebar": "#182235", "surface": "#202c40",
-        "text": "#f3f6fc", "muted": "#b6c3d6", "primary": "#4f8cff",
-        "accent": "#a78bfa", "border": "#36445c", "bpm_bg": "#2b2448",
-        "bpm": "#c4b5fd", "info_bg": "#203b60", "info_text": "#dbeafe",
+    "Dark": {
+        "page": "#000000", "sidebar": "#080808", "surface": "#111111",
+        "text": "#FFFFFF", "muted": "#C0C0C0", "primary": "#20DCC8",
+        "accent": "#40F5DF", "border": "#303030", "bpm_bg": "#151515",
+        "bpm": "#40F5DF", "info_bg": "#102725", "info_text": "#BFFFF5",
     },
-    "Sage": {
-        "page": "#f3f5ed", "sidebar": "#e5eadb", "surface": "#ffffff",
-        "text": "#293d30", "muted": "#617363", "primary": "#477653",
-        "accent": "#93a96b", "border": "#d5dfca", "bpm_bg": "#eaf2df",
-        "bpm": "#477653", "info_bg": "#e1ebd8", "info_text": "#304d35",
-    },
-    "Minimal": {
-        "page": "#f4f6f8", "sidebar": "#e9edf1", "surface": "#ffffff",
-        "text": "#202b38", "muted": "#5e6b79", "primary": "#334e68",
-        "accent": "#0f8b8d", "border": "#d7dfe7", "bpm_bg": "#e4f3f2",
-        "bpm": "#087f8c", "info_bg": "#e3edf7", "info_text": "#284d70",
-    },
-
-    "Cyberpunk": {
-        "page": "#100d1c", "sidebar": "#19132b", "surface": "#211a35",
-        "text": "#f5f0ff", "muted": "#c0b4dc", "primary": "#a855f7",
-        "accent": "#22d3ee", "border": "#44305f", "bpm_bg": "#261b3d",
-        "bpm": "#22d3ee", "info_bg": "#202744", "info_text": "#dbeafe",
-    },
-    "Deep Ocean": {
-        "page": "#071923", "sidebar": "#0b2533", "surface": "#103141",
-        "text": "#eaf7fc", "muted": "#a8c5d1", "primary": "#0ea5b7",
-        "accent": "#38d9c5", "border": "#245060", "bpm_bg": "#103542",
-        "bpm": "#38d9c5", "info_bg": "#16384c", "info_text": "#d8f1ff",
-    },
-    "AMOLED Black": {
-        "page": "#000000", "sidebar": "#080b0a", "surface": "#111614",
-        "text": "#f4fff8", "muted": "#b2c5b9", "primary": "#00a86b",
-        "accent": "#65f0ad", "border": "#294638", "bpm_bg": "#0d2118",
-        "bpm": "#65f0ad", "info_bg": "#10271d", "info_text": "#d7ffea",
-    },
-    "Clean Light": {"page": "#f4f7fb", "sidebar": "#ffffff", "surface": "#ffffff", "text": "#202940", "muted": "#65718a", "primary": "#536dfe", "accent": "#8b9cff", "border": "#dfe5f0", "bpm_bg": "#edf0ff", "bpm": "#4058db", "info_bg": "#e8efff", "info_text": "#304b91"},
-    "Neon AI": {"page": "#100821", "sidebar": "#160d2b", "surface": "#211238", "text": "#f8f3ff", "muted": "#c0addd", "primary": "#a855f7", "accent": "#00e5ff", "border": "#44305f", "bpm_bg": "#281744", "bpm": "#00e5ff", "info_bg": "#202744", "info_text": "#dbeafe"},
-    "Forest": {"page": "#0b201b", "sidebar": "#102a22", "surface": "#174333", "text": "#f0fff7", "muted": "#b4d7c7", "primary": "#46b889", "accent": "#72e6b1", "border": "#285744", "bpm_bg": "#173d32", "bpm": "#72e6b1", "info_bg": "#20483a", "info_text": "#d8ffea"},
 }
 
-if "selected_theme" not in st.session_state:
-    st.session_state.selected_theme = "Ocean"
+if st.session_state.get("selected_theme") not in THEMES:
+    st.session_state.selected_theme = "Light"
 
 selected_theme = st.session_state.selected_theme
 theme = THEMES[selected_theme]
@@ -114,7 +80,7 @@ st.markdown(
     f"""
 <style>
 :root {{
-    color-scheme: {"dark" if selected_theme in ("Midnight", "Cyberpunk", "Deep Ocean", "AMOLED Black") else "light"};
+    color-scheme: {"dark" if selected_theme == "Dark" else "light"};
 }}
 .stApp {{
     background: {theme["page"]} !important;
@@ -575,7 +541,7 @@ if st.session_state.authenticated_user is None:
 
     .stButton > button,
     [data-testid="stFormSubmitButton"] button {
-        background: linear-gradient(100deg, #0fa6b7, #39d9c5) !important;
+        background: #000000 !important;
         color: #05202a !important;
         border: none !important;
         border-radius: 10px !important;
@@ -625,7 +591,7 @@ if st.session_state.authenticated_user is None:
         <div style="padding-top: 32px;">
             <div class="hr-eyebrow">AI-POWERED WELLNESS</div>
             <div class="hr-heart">♥</div>
-            <div class="hr-brand">Heart Rate<br><span>AI.</span></div>
+            <div class="hr-brand">Pulse<span>Vision</span></div>
             <div class="hr-tagline">
                 Your personal wellness space, powered by intelligent
                 heart-rate monitoring and real-time signal analysis.
@@ -767,7 +733,7 @@ if st.session_state.authenticated_user is None:
 
         st.markdown(
             '<div class="hr-footer">'
-            'HEART RATE AI · INTELLIGENCE FOR YOUR WELLNESS'
+            'PULSEVISION · INTELLIGENCE FOR YOUR WELLNESS'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -1534,28 +1500,58 @@ with st.sidebar:
     st.markdown("### Appearance")
 
     st.selectbox(
-        "Choose a theme",
+        "Choose appearance",
         options=list(THEMES.keys()),
         key="selected_theme",
         help="Change the dashboard colour palette."
     )
 
-    st.divider()
+    # Show navigation and measurement controls to regular users only.
+    if st.session_state.user_role != "admin":
+        st.divider()
 
-    st.radio(
-        "NAVIGATION",
-        options=[
-            "Dashboard",
-            "Live Measurement",
-            "Measurement History",
-            "Settings",
-            "Wellness Arcade",
-        ],
-        key="user_navigation",
-        label_visibility="visible",
-    )
+        st.radio(
+            "NAVIGATION",
+            options=[
+                "Dashboard",
+                "Live Measurement",
+                "Measurement History",
+                "Settings",
+                "Wellness Arcade",
+            ],
+            key="user_navigation",
+            label_visibility="visible",
+        )
 
-    st.divider()
+        st.divider()
+
+        st.markdown("### Measurement Settings")
+
+        required_samples = st.slider(
+            "Required samples",
+            MIN_SAMPLES,
+            MAX_SAMPLES,
+            MIN_SAMPLES,
+            20,
+            help="BPM estimation begins after this number of samples.",
+        )
+
+        show_roi = st.toggle("Show forehead ROI", True)
+        show_signal = st.toggle("Show live signal", True)
+
+        st.divider()
+
+        st.info(
+            """
+**For better readings**
+
+• Keep your head still  
+• Face the camera in steady lighting  
+• Avoid sudden movements while measuring
+"""
+        )
+
+        st.divider()
 
     st.markdown("### My Account")
     st.write(f"**{st.session_state.user_name}**")
@@ -1571,63 +1567,10 @@ with st.sidebar:
         st.session_state.pop("user_name", None)
         st.rerun()
 
-    st.divider()
-
-    st.markdown(
-        "## Heart Rate AI"
-    )
-
-    st.caption(
-        "Contactless heart-rate estimation "
-        "using facial video and rPPG."
-    )
-
-    st.divider()
-
-    st.markdown(
-        "### Measurement Settings"
-    )
-
-    required_samples = st.slider(
-        "Required samples",
-        MIN_SAMPLES,
-        MAX_SAMPLES,
-        MIN_SAMPLES,
-        20,
-        help=(
-            "BPM estimation begins after this "
-            "number of samples."
-        )
-    )
-
-    show_roi = st.toggle(
-        "Show forehead ROI",
-        True
-    )
-
-    show_signal = st.toggle(
-        "Show live signal",
-        True
-    )
 
     st.divider()
 
 
-
-    st.divider()
-
-    st.info(
-        """
-**For better readings**
-
-• Keep your head still  
-• Look directly at the camera  
-• Keep hands away from your face  
-• Use steady front lighting  
-• Avoid strong backlighting  
-• Wait until the BPM is locked
-"""
-    )
 
 
 
@@ -1796,7 +1739,7 @@ if st.session_state.user_role != "admin":
 
         st.subheader("Appearance")
         st.write(
-            "Use the **Choose a theme** selector in the sidebar "
+            "Use the **Choose appearance** selector in the sidebar "
             "to change the dashboard colours."
         )
 
@@ -2352,9 +2295,10 @@ if selected_page == "Dashboard":
         """
         <div style="padding:18px 22px; margin:18px 0;
                     border-radius:18px;
-                    background:linear-gradient(120deg,#e4f5ff,#f0eaff);
-                    color:#203047;">
-            <h3 style="margin:0 0 6px 0;">💙 Your heart, your health!</h3>
+                    background:{theme["surface"]};
+                    color:{theme["text"]};
+                    border:1px solid {theme["border"]};
+            <h3 style="margin:0 0 6px 0;">Your heart, your health!</h3>
             <p style="margin:0;">Ready for a quick, contactless heart-rate estimate?</p>
         </div>
         """,
@@ -2461,11 +2405,9 @@ if selected_page == "Dashboard":
         border-radius: 26px;
         margin: 14px 0 26px;
         border: 1px solid rgba(255,255,255,.16);
-        background:
-            radial-gradient(ellipse at 90% 10%, rgba(130,110,255,.22), transparent 38%),
-            linear-gradient(120deg, #103f36 0%, #153747 55%, #25234b 100%);
-        color: #ffffff !important;
-        box-shadow: 0 16px 38px rgba(22,50,65,.16);
+        background: var(--dashboard-surface, #111827);
+        color: var(--dashboard-text, #ffffff) !important;
+        box-shadow: 0 16px 38px rgba(0,0,0,.18);
         transition: transform .25s ease, box-shadow .25s ease;
     }
     .wellness-hero:hover {
@@ -2488,7 +2430,7 @@ if selected_page == "Dashboard":
     .wellness-hero .hero-label {
         position: relative;
         z-index: 1;
-        color: #ffffff !important;
+        color: var(--dashboard-text, #ffffff) !important;
         opacity: 1 !important;
     }
     .wellness-hero h2 {
@@ -2499,7 +2441,7 @@ if selected_page == "Dashboard":
     }
     .wellness-hero p {
         margin: 0;
-        color: #dcefe9 !important;
+        color: var(--dashboard-muted, #b6c3d6) !important;
         font-size: 14px;
         line-height: 1.7;
     }
@@ -2516,7 +2458,7 @@ if selected_page == "Dashboard":
         font-weight: 750;
         text-transform: uppercase;
         letter-spacing: 1.7px;
-        color: #bcefe0 !important;
+        color: var(--dashboard-primary, #4f8cff) !important;
     }
 
     .section-heading {
@@ -3750,7 +3692,7 @@ if st.session_state.running:
                             st.session_state.signal_buffer
                         )
                         >
-                        MAX_SAMPLES
+                        required_samples
                     ):
 
                         st.session_state.signal_buffer.pop(
@@ -4343,9 +4285,3 @@ if st.session_state.running:
 # FOOTER
 # ============================================================
 
-st.divider()
-
-st.caption(
-    "Heart Rate AI • Contactless rPPG Monitoring • "
-    "Educational and Research Prototype"
-)
